@@ -39,7 +39,9 @@ start() {
         return 0
     fi
     build_if_needed
-    open "$APP_DIR"
+    if ! open "$APP_DIR" 2>/dev/null; then
+        nohup "$APP_DIR/Contents/MacOS/$PROCESS_NAME" >/dev/null 2>&1 &
+    fi
     # Give it a moment to come up (and stay up) before declaring success.
     for _ in {1..10}; do
         sleep 0.5
