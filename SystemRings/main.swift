@@ -260,14 +260,14 @@ struct GaugeItem: Identifiable {
     var chartStyle: MiniChartStyle = .sparkline
 }
 
-enum PillSeverity {
+enum PillSeverity: Equatable {
     case normal
     case accent
     case warning
     case critical
 }
 
-struct BoardPart: Identifiable {
+struct BoardPart: Identifiable, Equatable {
     let symbol: String
     let label: String
     let text: String
@@ -276,7 +276,7 @@ struct BoardPart: Identifiable {
     var id: String { symbol + label + text }
 }
 
-struct BoardRow: Identifiable {
+struct BoardRow: Identifiable, Equatable {
     let parts: [BoardPart]
     var id: String { parts.map(\.id).joined(separator: "|") }
 }
@@ -289,7 +289,7 @@ struct ProcessEntry: Identifiable {
     let gpuMs: Double
 }
 
-struct AlertBanner: Identifiable {
+struct AlertBanner: Identifiable, Equatable {
     let id: String
     let icon: String
     let message: String
@@ -851,7 +851,7 @@ final class BatterySampler {
     private static func numOf(_ any: Any?) -> Double? { (any as? NSNumber)?.doubleValue }
     private static func intOf(_ any: Any?) -> Int? { (any as? NSNumber)?.intValue }
 
-    private static func iopsReading() -> BatteryInfo? {
+    static func iopsReading() -> BatteryInfo? {
         guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue() else { return nil }
         guard let list = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef] else { return nil }
 
@@ -906,6 +906,15 @@ final class Monitor: ObservableObject {
     @Published var battery: BatteryInfo?
 
     var onMenuBarUpdate: (() -> Void)?
+    var onLayoutNeedsResize: (() -> Void)?
+
+    init() {
+        if let initialBatt = BatterySampler.iopsReading(), initialBatt.present {
+            self.battery = initialBatt
+            self.items.append(batteryItem())
+        }
+        recomputeRowsAndWarnings()
+    }
 
     private var cpuPrev: (busy: Double, total: Double)?
     private var histories: [String: [Double]] = [:]
@@ -1153,10 +1162,14 @@ final class Monitor: ObservableObject {
     private func syncBatteryItem() {
         guard battery?.present == true else { return }
         let item = batteryItem()
+        let wasPresent = items.contains(where: { $0.id == "batt" })
         if let i = items.firstIndex(where: { $0.id == "batt" }) {
             items[i] = item
         } else {
             items.append(item)
+        }
+        if !wasPresent {
+            onLayoutNeedsResize?()
         }
     }
 
@@ -1284,6 +1297,7 @@ final class Monitor: ObservableObject {
                             severity: .normal))
         if !r3.isEmpty { newRows.append(BoardRow(parts: r3)) }
 
+        let rowsChanged = (self.rows != newRows)
         self.rows = newRows
 
         // ── Compute active warnings ──
@@ -1342,7 +1356,11 @@ final class Monitor: ObservableObject {
                 isCritical: pct <= 10))
         }
 
+        let warningsChanged = (self.warnings != activeWarnings)
         self.warnings = activeWarnings
+        if rowsChanged || warningsChanged {
+            onLayoutNeedsResize?()
+        }
         if Prefs.desktopNotifications {
             for w in activeWarnings {
                 maybePostDesktopNotification(w)
@@ -2149,6 +2167,14 @@ struct TelemetryPill: View {
     }
 }
 
+private struct WidgetContentSizeKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        let next = nextValue()
+        if next != .zero { value = next }
+    }
+}
+
 struct WidgetView: View {
     @ObservedObject var monitor: Monitor
     var onResize: (() -> Void)? = nil
@@ -2299,12 +2325,24 @@ struct WidgetView: View {
                 )
         )
         .frame(width: panelWidth)
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(key: WidgetContentSizeKey.self, value: proxy.size)
+            }
+        )
+        .onPreferenceChange(WidgetContentSizeKey.self) { newSize in
+            guard newSize.width > 50 && newSize.height > 50 else { return }
+            onResize?()
+        }
         .onChange(of: monitor.items.count) { _ in onResize?() }
+        .onChange(of: monitor.rows.count) { _ in onResize?() }
+        .onChange(of: monitor.rows) { _ in onResize?() }
+        .onChange(of: monitor.warnings.count) { _ in onResize?() }
+        .onChange(of: monitor.warnings) { _ in onResize?() }
         .onChange(of: monitor.compact) { _ in onResize?() }
         .onChange(of: monitor.scale) { _ in onResize?() }
         .onChange(of: monitor.layoutMode) { _ in onResize?() }
         .onChange(of: monitor.selectedRingId) { _ in onResize?() }
-        .onChange(of: monitor.warnings.count) { _ in onResize?() }
         .onChange(of: monitor.showHeaderBar) { _ in onResize?() }
     }
 }
@@ -2392,13 +2430,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         monitor.onMenuBarUpdate = { [weak self] in
             self?.updateStatusItemAppearance()
         }
+        monitor.onLayoutNeedsResize = { [weak self] in
+            self?.scheduleResize()
+        }
 
+        monitor.tick()
         setupWindow()
         applyWindowLevel()
         applyContentSize()
         installStatusItem()
         startTimer()
-        monitor.tick()
+        scheduleResize(delay: 0.1)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -2424,13 +2466,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fx.wantsLayer = true
         fx.layer?.cornerRadius = 26
         fx.layer?.masksToBounds = true
+        fx.autoresizingMask = [.width, .height]
         fxView = fx
 
         let container = NSView()
         container.addSubview(fx)
         container.addSubview(hosting)
+        hosting.autoresizingMask = [.width, .height]
 
-        let startSize = NSSize(width: 500, height: 190)
+        let fit = hosting.fittingSize
+        let startWidth = max(fit.width, 500)
+        let startHeight = max(fit.height, 220)
+        let startSize = NSSize(width: startWidth, height: startHeight)
+        container.frame = NSRect(origin: .zero, size: startSize)
+        fx.frame = container.bounds
+        hosting.frame = container.bounds
+
         let win = WidgetWindow(contentRect: NSRect(origin: defaultOrigin(size: startSize),
                                                    size: startSize),
                                styleMask: [.borderless],
@@ -2458,17 +2509,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func positionWindow() {
         guard let win = window else { return }
         let size = win.frame.size
-        var origin: NSPoint?
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return }
+
         if let saved = Prefs.widgetOrigin {
-            let rect = NSRect(origin: saved, size: size)
-            if NSScreen.screens.contains(where: { $0.visibleFrame.contains(rect) }) {
-                origin = saved
+            let targetScreen = screens.first(where: { $0.visibleFrame.contains(saved) })
+                ?? screens.first(where: { $0.visibleFrame.intersects(NSRect(origin: saved, size: size)) })
+                ?? NSScreen.main
+                ?? screens[0]
+
+            let vf = targetScreen.visibleFrame
+            let clampedX = min(max(saved.x, vf.minX), max(vf.minX, vf.maxX - size.width))
+            let clampedY = min(max(saved.y, vf.minY), max(vf.minY, vf.maxY - size.height))
+            let newOrigin = NSPoint(x: clampedX, y: clampedY)
+            if abs(win.frame.origin.x - newOrigin.x) >= 0.5 || abs(win.frame.origin.y - newOrigin.y) >= 0.5 {
+                win.setFrameOrigin(newOrigin)
             }
+        } else {
+            win.setFrameOrigin(defaultOrigin(size: size))
         }
-        if origin == nil {
-            origin = defaultOrigin(size: size)
-        }
-        win.setFrameOrigin(origin!)
     }
 
     private func saveFrame() {
@@ -2496,8 +2555,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let fit = host.fittingSize
         dbg("applyContentSize: fit=\(fit) scale=\(monitor.scale) compact=\(monitor.compact) layout=\(monitor.layoutMode.rawValue)")
         let size = NSSize(width: max(fit.width, 220), height: max(fit.height, 110))
-        win.setContentSize(size)
-        positionWindow()
+        let curSize = win.frame.size
+        let sizeChanged = abs(curSize.width - size.width) >= 0.5 || abs(curSize.height - size.height) >= 0.5
+
+        if sizeChanged {
+            win.setContentSize(size)
+            positionWindow()
+        }
         if let container = win.contentView {
             container.frame = NSRect(origin: .zero, size: size)
             fx.frame = container.bounds
@@ -2506,10 +2570,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fx.layer?.cornerRadius = 26 * CGFloat(monitor.scale)
     }
 
-    private func scheduleResize() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+    private var resizeWorkItem: DispatchWorkItem?
+
+    private func scheduleResize(delay: TimeInterval = 0.05) {
+        resizeWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
             self?.applyContentSize()
         }
+        resizeWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     // MARK: Menu-bar item & live readout
